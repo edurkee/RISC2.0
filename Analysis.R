@@ -95,7 +95,7 @@ leaflet(accident_sf_2023) %>%
 aadt_url <- "https://gis1.dot.illinois.gov/arcgis/rest/services/AdministrativeData/AADT_Historical/FeatureServer/2023/query?where=1=1&outFields=*&f=geojson"
 
 ## read in once 2023 aadt data one time
-# roads_aadt_2023 <- st_read(aadt_url) 
+roads_aadt_2023 <- st_read(aadt_url) 
 saveRDS(roads_aadt_2023, "2023roads_aadt.rds")
 roads_aadt_2023 <- readRDS("2023roads_aadt.rds")
 

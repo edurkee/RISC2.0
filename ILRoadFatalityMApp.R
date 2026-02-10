@@ -24,11 +24,33 @@ ui <- fluidPage(
                   min = 2, max = 10, value = 4, step = 1),
       radioButtons("display_mode", "Display style:",
                    choices = c("Circles" = "circles", "Polygons" = "polygons"),
-                   selected = "polygons", inline = TRUE),
+                   selected = "circles", inline = TRUE),
       checkboxInput("remove_outliers", "Remove outliers (top 2.5%)", value = FALSE),
       checkboxInput("top_100", "Show only top 100 most dangerous", value = FALSE),
       hr(),
       uiOutput("stats"),
+      hr(),
+      tags$details(
+        tags$summary(style = "cursor:pointer; font-weight:bold; font-size:13px;", "How to use this map"),
+        tags$div(style = "font-size:12px; color:#555; margin-top:8px;",
+          tags$p(tags$b("Clusters Parameters:"), "Define your clusters by max distance between fatalities",
+                 "and minimum number of fatal crashes required to form a cluster."),
+          tags$p(tags$b("Display style:"), "Use Circle display to identify cluster centroids.",
+                 "Use polygon display (and tighter cluster distance) to identify whether risk focuses on an intersection or corridor."),
+          tags$p(tags$b("Remove outliers:"), "Hides the top 2.5% of clusters by",
+                 "fatality rate to reduce the effect of extreme values on the color scale."),
+          tags$p(tags$b("Top 100:"), "Shows only the 100 clusters with the highest fatality rate."),
+          tags$p(tags$b("Color:"), "Darker red = higher fatality rate per 100,000 vehicles.",
+                 "Rate is calculated as fatalities / (AADT x 365 x years active) x 100,000."),
+          tags$hr(),
+          tags$p(tags$b("Data sources")),
+          tags$ul(
+            tags$li("Crash data: NHTSA FARS (Fatality Analysis Reporting System), 2004-2023"),
+            tags$li("Traffic volume: IDOT AADT Historical, 2023 layer"),
+            tags$li("Crash locations are snapped to the nearest road segment for clustering")
+          )
+        )
+      ),
       width = 3
     ),
     mainPanel(
