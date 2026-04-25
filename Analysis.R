@@ -204,31 +204,32 @@ load_fars_il <- function(year) {
     select(ST_CASE, STATE, COUNTY, LATITUDE, LONGITUD, FATALS, PEDS, year)
 }
 
-load_fars_vehicles <- function(year) {
-  veh_file <- list.files(
+load_fars_persons <- function(year) {
+  per_file <- list.files(
     file.path("fars_raw", year),
-    pattern = "^vehicle\\.csv$",
+    pattern = "^person\\.csv$",
     recursive = TRUE,
     ignore.case = TRUE,
     full.names = TRUE
   )
-  if (length(veh_file) == 0) return(NULL)
-  df <- read_csv(veh_file[1], col_types = cols(.default = col_guess()))
+  if (length(per_file) == 0) return(NULL)
+  df <- read_csv(per_file[1], col_types = cols(.default = col_guess()))
   names(df) <- toupper(names(df))
-  if (!"BODY_TYP" %in% names(df)) return(NULL)
+  if (!all(c("PER_TYP", "INJ_SEV") %in% names(df))) return(NULL)
   df %>%
     filter(STATE == 17) %>%
     mutate(year = as.integer(year), ST_CASE = as.numeric(ST_CASE)) %>%
-    select(ST_CASE, year, BODY_TYP)
+    select(ST_CASE, year, PER_TYP, INJ_SEV)
 }
 
 all_accidents_il <- purrr::map_dfr(years, load_fars_il)
 
 # Classify each crash as pedestrian, motorcycle, or car
-all_vehicles_il <- purrr::map_dfr(years, load_fars_vehicles)
+# Motorcycle: a crash where a motorcyclist (PER_TYP 6/7) was fatally injured (INJ_SEV 4)
+all_persons_il <- purrr::map_dfr(years, load_fars_persons)
 
-motorcycle_cases <- all_vehicles_il %>%
-  filter(BODY_TYP >= 20, BODY_TYP <= 29) %>%
+motorcycle_cases <- all_persons_il %>%
+  filter(PER_TYP %in% c(6, 7), INJ_SEV == 4) %>%
   select(ST_CASE, year) %>%
   distinct() %>%
   mutate(is_motorcycle = TRUE)
