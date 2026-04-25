@@ -3,14 +3,17 @@ library(leaflet)
 library(dplyr)
 library(sf)
 
-app_data         <- readRDS("moto_road_data.rds")
-roads            <- app_data$roads
-total_fatalities <- app_data$total_fatalities
+app_data     <- readRDS("moto_road_data.rds")
+roads_rider  <- app_data$roads_rider
+roads_all    <- app_data$roads_all
+total_rider  <- app_data$total_rider
+total_all    <- app_data$total_all
 
 ui <- fluidPage(
   titlePanel("Illinois Motorcycle Fatality Map (2004-2023)"),
   sidebarLayout(
     sidebarPanel(
+      checkboxInput("all_moto", "Include all crashes involving a motorcycle", value = FALSE),
       sliderInput("min_fatals", "Min fatalities per segment:",
                   min = 1, max = 10, value = 1, step = 1),
       checkboxInput("remove_outliers", "Remove outliers (top 2.5%)", value = FALSE),
@@ -28,9 +31,13 @@ ui <- fluidPage(
                  "Rate = fatalities / (AADT × 365 × years active) × 100,000."),
           tags$hr(),
           tags$p(tags$b("Data sources")),
+          tags$p(tags$b("All motorcycle crashes:"), "When checked, shows any crash where a motorcycle",
+                 "was present — even if the fatality was a car driver. Unchecked shows only crashes",
+                 "where the rider or passenger died."),
           tags$ul(
-            tags$li("Crash data: NHTSA FARS (2004-2023) — motorcyclist fatalities only"),
-            tags$li("A crash is counted as a motorcycle fatality only when a rider or passenger (PER_TYP 6/7) died"),
+            tags$li("Crash data: NHTSA FARS (2004-2023)"),
+            tags$li("Rider fatalities: crashes where a motorcyclist (PER_TYP 6/7) died"),
+            tags$li("All motorcycle crashes: any crash with a motorcycle present (vehicle BODY_TYP 20-29)"),
             tags$li("Traffic volume: IDOT AADT Historical, 2023 layer"),
             tags$li("Crashes snapped to nearest road segment")
           )
@@ -47,8 +54,16 @@ ui <- fluidPage(
 
 server <- function(input, output, session) {
 
+  active_roads <- reactive({
+    if (input$all_moto) roads_all else roads_rider
+  })
+
+  active_total <- reactive({
+    if (input$all_moto) total_all else total_rider
+  })
+
   filtered <- reactive({
-    s <- roads %>% filter(fatalities >= input$min_fatals)
+    s <- active_roads() %>% filter(fatalities >= input$min_fatals)
     if (input$remove_outliers) {
       cutoff <- quantile(s$rate_per_100k, 0.975)
       s <- s %>% filter(rate_per_100k <= cutoff)
@@ -106,18 +121,19 @@ server <- function(input, output, session) {
 
     n_removed <- 0
     if (input$remove_outliers) {
-      pre    <- roads %>% filter(fatalities >= input$min_fatals)
+      pre    <- active_roads() %>% filter(fatalities >= input$min_fatals)
       cutoff <- quantile(pre$rate_per_100k, 0.975)
       n_removed <- sum(pre$rate_per_100k > cutoff)
     }
 
     displayed  <- sum(s$fatalities)
-    pct        <- round(displayed / total_fatalities * 100, 1)
+    pct        <- round(displayed / active_total() * 100, 1)
     total_km   <- round(sum(s$length_km), 1)
+    label      <- if (input$all_moto) "all motorcycle-involved" else "motorcyclist"
 
     tags <- tagList(
-      h4(paste0(pct, "% of IL motorcycle fatalities")),
-      p(paste0(displayed, " of ", total_fatalities, " fatalities")),
+      h4(paste0(pct, "% of IL ", label, " fatalities")),
+      p(paste0(displayed, " of ", active_total(), " fatalities")),
       p(paste0("across ", nrow(s), " road segments")),
       p(paste0("Total road length: ", total_km, " km"))
     )

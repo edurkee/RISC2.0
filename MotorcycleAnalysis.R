@@ -60,49 +60,101 @@ load_moto_accidents <- function(year) {
     select(ST_CASE, LATITUDE, LONGITUD, FATALS, year)
 }
 
-message("Loading motorcycle crashes...")
-moto_il <- purrr::map_dfr(years, load_moto_accidents)
-message(nrow(moto_il), " motorcycle fatal crashes loaded")
-
-# Make spatial and snap to nearest road segment
-moto_sf <- st_as_sf(moto_il, coords = c("LONGITUD", "LATITUDE"), crs = 4326) %>%
-  st_transform(26916)
-
-nearest_seg <- st_nearest_feature(moto_sf, roads_aadt_2023_m)
-moto_sf$segment_id <- roads_aadt_2023_m$segment_id[nearest_seg]
-
-# Aggregate fatalities by road segment
-moto_by_segment <- moto_sf %>%
-  st_drop_geometry() %>%
-  group_by(segment_id) %>%
-  summarize(
-    fatalities = sum(FATALS),
-    n_crashes  = n(),
-    n_years    = n_distinct(year),
-    year_span  = max(year) - min(year) + 1L,
-    year_range = paste(min(year), max(year), sep = "-"),
-    .groups    = "drop"
+# All crashes where a motorcycle was present (any vehicle with BODY_TYP 20-29)
+load_all_moto_accidents <- function(year) {
+  acc_file <- list.files(
+    file.path("fars_raw", year),
+    pattern = "^accident\\.csv$",
+    recursive = TRUE, ignore.case = TRUE, full.names = TRUE
   )
+  veh_file <- list.files(
+    file.path("fars_raw", year),
+    pattern = "^vehicle\\.csv$",
+    recursive = TRUE, ignore.case = TRUE, full.names = TRUE
+  )
+  if (length(acc_file) == 0 || length(veh_file) == 0) return(NULL)
 
-# Join back to road geometries with AADT
-moto_roads_sf <- roads_aadt_2023_m %>%
-  select(segment_id, AADT, geometry) %>%
-  inner_join(moto_by_segment, by = "segment_id") %>%
-  mutate(
-    exposure      = AADT * 365 * year_span,
-    rate_per_100k = (fatalities / exposure) * 100000,
-    length_km     = as.numeric(st_length(geometry)) / 1000
-  ) %>%
-  filter(is.finite(rate_per_100k), rate_per_100k > 0) %>%
-  st_transform(4326) %>%
-  st_zm(drop = TRUE, what = "ZM")
+  acc <- read_csv(acc_file[1], col_types = cols(.default = col_guess()))
+  veh <- read_csv(veh_file[1], col_types = cols(.default = col_guess()))
+  names(acc) <- toupper(names(acc))
+  names(veh) <- toupper(names(veh))
 
-total_moto_fatalities <- sum(moto_il$FATALS)
-message(total_moto_fatalities, " total motorcycle fatalities across ",
-        nrow(moto_roads_sf), " road segments")
+  if (!"BODY_TYP" %in% names(veh)) return(NULL)
+
+  moto_cases <- veh %>%
+    filter(STATE == 17, BODY_TYP >= 20, BODY_TYP <= 29) %>%
+    mutate(ST_CASE = as.numeric(ST_CASE)) %>%
+    select(ST_CASE) %>%
+    distinct()
+
+  acc %>%
+    filter(STATE == 17) %>%
+    mutate(
+      LATITUDE = as.numeric(LATITUDE),
+      LONGITUD = as.numeric(LONGITUD),
+      ST_CASE  = as.numeric(ST_CASE),
+      year     = as.integer(year)
+    ) %>%
+    filter(
+      !is.na(LATITUDE), !is.na(LONGITUD),
+      LATITUDE >= 36, LATITUDE <= 43,
+      LONGITUD >= -92, LONGITUD <= -87
+    ) %>%
+    inner_join(moto_cases, by = "ST_CASE") %>%
+    select(ST_CASE, LATITUDE, LONGITUD, FATALS, year)
+}
+
+# Helper to snap crashes to road segments and aggregate
+snap_and_aggregate <- function(crashes_il) {
+  sf <- st_as_sf(crashes_il, coords = c("LONGITUD", "LATITUDE"), crs = 4326) %>%
+    st_transform(26916)
+  sf$segment_id <- roads_aadt_2023_m$segment_id[st_nearest_feature(sf, roads_aadt_2023_m)]
+
+  by_seg <- sf %>%
+    st_drop_geometry() %>%
+    group_by(segment_id) %>%
+    summarize(
+      fatalities = sum(FATALS),
+      n_crashes  = n(),
+      n_years    = n_distinct(year),
+      year_span  = max(year) - min(year) + 1L,
+      year_range = paste(min(year), max(year), sep = "-"),
+      .groups    = "drop"
+    )
+
+  roads_aadt_2023_m %>%
+    select(segment_id, AADT, geometry) %>%
+    inner_join(by_seg, by = "segment_id") %>%
+    mutate(
+      exposure      = AADT * 365 * year_span,
+      rate_per_100k = (fatalities / exposure) * 100000,
+      length_km     = as.numeric(st_length(geometry)) / 1000
+    ) %>%
+    filter(is.finite(rate_per_100k), rate_per_100k > 0) %>%
+    st_transform(4326) %>%
+    st_zm(drop = TRUE, what = "ZM")
+}
+
+message("Loading crashes where a motorcyclist died...")
+moto_il <- purrr::map_dfr(years, load_moto_accidents)
+message(nrow(moto_il), " crashes loaded")
+roads_rider <- snap_and_aggregate(moto_il)
+
+message("Loading all crashes involving a motorcycle...")
+all_moto_il <- purrr::map_dfr(years, load_all_moto_accidents)
+message(nrow(all_moto_il), " crashes loaded")
+roads_all <- snap_and_aggregate(all_moto_il)
+
+message("Rider fatalities: ", sum(moto_il$FATALS), " across ", nrow(roads_rider), " segments")
+message("All moto-involved fatalities: ", sum(all_moto_il$FATALS), " across ", nrow(roads_all), " segments")
 
 saveRDS(
-  list(roads = moto_roads_sf, total_fatalities = total_moto_fatalities),
+  list(
+    roads_rider      = roads_rider,
+    roads_all        = roads_all,
+    total_rider      = sum(moto_il$FATALS),
+    total_all        = sum(all_moto_il$FATALS)
+  ),
   "moto_road_data.rds"
 )
 message("Saved moto_road_data.rds")
