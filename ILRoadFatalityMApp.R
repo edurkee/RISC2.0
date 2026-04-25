@@ -4,15 +4,34 @@ library(dplyr)
 library(dbscan)
 library(sf)
 
-# Load precomputed data (run Analysis.R first to generate this)
 app_data <- readRDS("cluster_app_data.rds")
 
-snap_pts        <- app_data$snap_pts
-fatals          <- app_data$fatals
-crash_years     <- app_data$years
-segment_ids     <- app_data$segment_ids
-aadt_lookup     <- app_data$aadt_lookup
-total_fatalities <- app_data$total_il_fatalities
+snap_pts           <- app_data$snap_pts
+fatals             <- app_data$fatals
+crash_years        <- app_data$years
+segment_ids        <- app_data$segment_ids
+crash_type         <- app_data$crash_type
+aadt_lookup        <- app_data$aadt_lookup
+total_fatalities   <- app_data$total_il_fatalities
+fatalities_by_type <- app_data$fatalities_by_type
+
+type_colors <- list(
+  car        = c("#ff7676", "#440000"),
+  pedestrian = c("#76b8ff", "#002b6b"),
+  motorcycle = c("#d476ff", "#2d0044")
+)
+type_labels <- c(car = "Car / Other Vehicle", pedestrian = "Pedestrian", motorcycle = "Motorcycle")
+
+# Pre-split data by crash type so we don't re-filter on every slider change
+data_by_type <- setNames(lapply(c("car", "pedestrian", "motorcycle"), function(t) {
+  idx <- which(crash_type == t)
+  list(
+    snap_pts    = snap_pts[idx, , drop = FALSE],
+    fatals      = fatals[idx],
+    years       = crash_years[idx],
+    segment_ids = segment_ids[idx]
+  )
+}), c("car", "pedestrian", "motorcycle"))
 
 ui <- fluidPage(
   titlePanel("Illinois Road Fatality Map (2004-2023)"),
@@ -25,6 +44,11 @@ ui <- fluidPage(
       radioButtons("display_mode", "Display style:",
                    choices = c("Circles" = "circles", "Polygons" = "polygons"),
                    selected = "circles", inline = TRUE),
+      checkboxGroupInput("crash_types", "Crash types:",
+                         choices = c("Car / Other Vehicle" = "car",
+                                     "Pedestrian" = "pedestrian",
+                                     "Motorcycle" = "motorcycle"),
+                         selected = c("car", "pedestrian", "motorcycle")),
       checkboxInput("remove_outliers", "Remove outliers (top 2.5%)", value = FALSE),
       checkboxInput("top_100", "Show only top 100 most dangerous", value = FALSE),
       hr(),
@@ -33,14 +57,16 @@ ui <- fluidPage(
       tags$details(
         tags$summary(style = "cursor:pointer; font-weight:bold; font-size:13px;", "How to use this map"),
         tags$div(style = "font-size:12px; color:#555; margin-top:8px;",
-          tags$p(tags$b("Clusters Parameters:"), "Define your clusters by max distance between fatalities",
+          tags$p(tags$b("Cluster Parameters:"), "Define your clusters by max distance between fatalities",
                  "and minimum number of fatal crashes required to form a cluster."),
           tags$p(tags$b("Display style:"), "Use Circle display to identify cluster centroids.",
                  "Use polygon display (and tighter cluster distance) to identify whether risk focuses on an intersection or corridor."),
+          tags$p(tags$b("Crash types:"), "Filter to Pedestrian (blue), Motorcycle (purple), or Car/Other (red).",
+                 "Each type is clustered independently."),
           tags$p(tags$b("Remove outliers:"), "Hides the top 2.5% of clusters by",
                  "fatality rate to reduce the effect of extreme values on the color scale."),
-          tags$p(tags$b("Top 100:"), "Shows only the 100 clusters with the highest fatality rate."),
-          tags$p(tags$b("Color:"), "Darker red = higher fatality rate per 100,000 vehicles.",
+          tags$p(tags$b("Top 100:"), "Shows only the 100 clusters with the highest fatality rate per type."),
+          tags$p(tags$b("Color:"), "Darker = higher fatality rate per 100,000 vehicles.",
                  "Rate is calculated as fatalities / (AADT x 365 x years active) x 100,000."),
           tags$hr(),
           tags$p(tags$b("Data sources")),
@@ -62,79 +88,80 @@ ui <- fluidPage(
 
 server <- function(input, output, session) {
 
-  # Debounce inputs so dragging sliders doesn't spam DBSCAN
   eps_d    <- debounce(reactive(input$eps), 300)
   minPts_d <- debounce(reactive(input$minPts), 300)
 
+  # Run DBSCAN independently for each selected crash type
   clusters <- reactive({
-    db <- dbscan(snap_pts, eps = eps_d(), minPts = minPts_d())
-    cluster_id <- db$cluster
+    selected <- input$crash_types
+    if (length(selected) == 0) return(NULL)
 
-    # Build a lightweight data frame for summarization
-    df <- data.frame(
-      cluster = cluster_id,
-      fatals = fatals,
-      year = crash_years,
-      segment_id = segment_ids,
-      x = snap_pts[, 1],
-      y = snap_pts[, 2]
-    ) %>%
-      filter(cluster > 0) %>%
-      left_join(aadt_lookup, by = "segment_id")
+    results <- setNames(lapply(selected, function(type) {
+      fd <- data_by_type[[type]]
+      if (nrow(fd$snap_pts) == 0) return(NULL)
 
-    if (nrow(df) == 0) return(NULL)
+      db <- dbscan(fd$snap_pts, eps = eps_d(), minPts = minPts_d())
+      cluster_id <- db$cluster
 
-    # Build convex hull polygons per cluster (buffered so small clusters are visible)
-    hulls <- df %>%
-      group_by(cluster) %>%
-      group_map(~ {
-        pts <- as.matrix(.x[, c("x", "y")])
-        mp <- st_multipoint(pts)
-        if (nrow(pts) >= 3) {
-          # Convex hull + buffer for visible area
-          geom <- st_buffer(st_convex_hull(mp), dist = 50)
-        } else {
-          # Too few points for a hull — just buffer the points
-          geom <- st_buffer(mp, dist = 50)
-        }
-        geom
-      })
-    hull_sfc <- st_sfc(hulls, crs = 26916)
-
-    # Summarize stats per cluster
-    summary <- df %>%
-      group_by(cluster) %>%
-      summarize(
-        fatalities = sum(fatals),
-        n_crashes = n(),
-        n_years = n_distinct(year),
-        year_span = max(year) - min(year) + 1L,
-        year_range = paste(min(year), max(year), sep = "-"),
-        avg_aadt = mean(AADT, na.rm = TRUE),
-        .groups = "drop"
+      df <- data.frame(
+        cluster    = cluster_id,
+        fatals     = fd$fatals,
+        year       = fd$years,
+        segment_id = fd$segment_ids,
+        x          = fd$snap_pts[, 1],
+        y          = fd$snap_pts[, 2]
       ) %>%
-      mutate(
-        exposure = avg_aadt * 365 * year_span,
-        rate_per_100k = (fatalities / exposure) * 100000
-      ) %>%
-      filter(is.finite(rate_per_100k))
+        filter(cluster > 0) %>%
+        left_join(aadt_lookup, by = "segment_id")
 
-    # Attach hull geometries, compute area in meters, then transform to WGS84
-    summary_sf <- st_sf(summary, geometry = hull_sfc[summary$cluster])
-    summary_sf$area_sq_km <- as.numeric(st_area(summary_sf)) / 1e6
-    summary_sf <- st_transform(summary_sf, 4326)
+      if (nrow(df) == 0) return(NULL)
 
-    # Also compute centroids for circle mode
-    centroids <- st_centroid(summary_sf)
-    coords <- st_coordinates(centroids)
-    summary_sf$lng <- coords[, 1]
-    summary_sf$lat <- coords[, 2]
+      hulls <- df %>%
+        group_by(cluster) %>%
+        group_map(~ {
+          pts <- as.matrix(.x[, c("x", "y")])
+          mp  <- st_multipoint(pts)
+          if (nrow(pts) >= 3) st_buffer(st_convex_hull(mp), dist = 50)
+          else                st_buffer(mp, dist = 50)
+        })
+      hull_sfc <- st_sfc(hulls, crs = 26916)
 
-    list(
-      summary_sf = summary_sf,
-      cluster_fatalities = sum(summary_sf$fatalities),
-      n_clusters = nrow(summary_sf)
-    )
+      summary <- df %>%
+        group_by(cluster) %>%
+        summarize(
+          fatalities = sum(fatals),
+          n_crashes  = n(),
+          n_years    = n_distinct(year),
+          year_span  = max(year) - min(year) + 1L,
+          year_range = paste(min(year), max(year), sep = "-"),
+          avg_aadt   = mean(AADT, na.rm = TRUE),
+          .groups    = "drop"
+        ) %>%
+        mutate(
+          exposure      = avg_aadt * 365 * year_span,
+          rate_per_100k = (fatalities / exposure) * 100000
+        ) %>%
+        filter(is.finite(rate_per_100k))
+
+      summary_sf <- st_sf(summary, geometry = hull_sfc[summary$cluster])
+      summary_sf$area_sq_km <- as.numeric(st_area(summary_sf)) / 1e6
+      summary_sf <- st_transform(summary_sf, 4326)
+
+      centroids <- st_centroid(summary_sf)
+      coords    <- st_coordinates(centroids)
+      summary_sf$lng <- coords[, 1]
+      summary_sf$lat <- coords[, 2]
+
+      summary_sf
+    }), selected)
+
+    Filter(Negate(is.null), results)
+  })
+
+  current_total <- reactive({
+    selected <- input$crash_types
+    if (length(selected) == 0) return(0)
+    sum(fatalities_by_type$fatalities[fatalities_by_type$crash_type %in% selected])
   })
 
   # Base map (rendered once)
@@ -155,98 +182,102 @@ server <- function(input, output, session) {
       )
   })
 
-  # Update map via proxy when sliders or display mode change
+  # Redraw all layers when anything changes
   observe({
-    res <- clusters()
+    res   <- clusters()
     proxy <- leafletProxy("map") %>%
       clearShapes() %>%
       clearMarkers() %>%
       clearControls()
 
-    if (is.null(res) || res$n_clusters == 0) return()
+    if (is.null(res) || length(res) == 0) return()
 
-    s <- res$summary_sf
+    for (type in names(res)) {
+      s <- res[[type]]
 
-    # Remove top 2.5% outliers if checked
-    if (input$remove_outliers) {
-      cutoff <- quantile(s$rate_per_100k, 0.975)
-      s <- s %>% filter(rate_per_100k <= cutoff)
-    }
+      if (input$remove_outliers) {
+        cutoff <- quantile(s$rate_per_100k, 0.975)
+        s <- s %>% filter(rate_per_100k <= cutoff)
+      }
+      if (input$top_100) {
+        s <- s %>% slice_max(rate_per_100k, n = 100)
+      }
+      if (nrow(s) == 0) next
 
-    # Show only top 100 most dangerous if checked
-    if (input$top_100) {
-      s <- s %>% slice_max(rate_per_100k, n = 100)
-    }
+      pal <- colorNumeric(type_colors[[type]], domain = s$rate_per_100k)
 
-    if (nrow(s) == 0) return()
+      popup_text <- paste0(
+        "<b>", type_labels[type], " Cluster ", s$cluster, "</b><br>",
+        "Fatalities: ", s$fatalities, "<br>",
+        "Crashes: ", s$n_crashes, "<br>",
+        "Rate per 100k: ", round(s$rate_per_100k, 4), "<br>",
+        "Years active: ", s$year_range, " (", s$n_years, " yrs)<br>",
+        "Avg AADT: ", round(s$avg_aadt)
+      )
 
-    pal <- colorNumeric(c("#ff7676", "#440000"), domain = s$rate_per_100k)
+      if (input$display_mode == "polygons") {
+        proxy <- proxy %>%
+          addPolygons(
+            data = s,
+            fillColor = ~pal(rate_per_100k),
+            fillOpacity = 0.6,
+            color = "#333", weight = 1, opacity = 0.8,
+            popup = popup_text
+          )
+      } else {
+        proxy <- proxy %>%
+          addCircleMarkers(
+            lng = s$lng, lat = s$lat,
+            radius = 6,
+            color = pal(s$rate_per_100k),
+            fillOpacity = 0.8,
+            stroke = TRUE, weight = 1,
+            popup = popup_text
+          )
+      }
 
-    popup_text <- paste0(
-      "<b>Cluster ", s$cluster, "</b><br>",
-      "Fatalities: ", s$fatalities, "<br>",
-      "Crashes: ", s$n_crashes, "<br>",
-      "Rate per 100k: ", round(s$rate_per_100k, 4), "<br>",
-      "Years active: ", s$year_range, " (", s$n_years, " yrs)<br>",
-      "Avg AADT: ", round(s$avg_aadt)
-    )
-
-    if (input$display_mode == "polygons") {
-      proxy %>%
-        addPolygons(
-          data = s,
-          fillColor = ~pal(rate_per_100k),
-          fillOpacity = 0.6,
-          color = "#333", weight = 1, opacity = 0.8,
-          popup = popup_text
-        ) %>%
+      proxy <- proxy %>%
         addLegend("bottomright", pal = pal, values = s$rate_per_100k,
-                  title = "Fatalities per<br>100k Vehicles")
-    } else {
-      proxy %>%
-        addCircleMarkers(
-          lng = s$lng, lat = s$lat,
-          radius = 6,
-          color = pal(s$rate_per_100k),
-          fillOpacity = 0.8,
-          stroke = TRUE, weight = 1,
-          popup = popup_text
-        ) %>%
-        addLegend("bottomright", pal = pal, values = s$rate_per_100k,
-                  title = "Fatalities per<br>100k Vehicles")
+                  title = paste0(type_labels[type], "<br>per 100k vehicles"))
     }
   })
 
   # Stats panel
   output$stats <- renderUI({
     res <- clusters()
-    if (is.null(res)) {
+    if (is.null(res) || length(res) == 0) {
       return(p("No clusters found with these parameters."))
     }
 
-    s <- res$summary_sf
-    n_removed <- 0
-    if (input$remove_outliers) {
-      cutoff <- quantile(s$rate_per_100k, 0.975)
-      n_removed <- sum(s$rate_per_100k > cutoff)
-      s <- s %>% filter(rate_per_100k <= cutoff)
+    total <- current_total()
+    if (total == 0) return(p("Select at least one crash type."))
+
+    all_fatalities <- 0
+    all_clusters   <- 0
+    all_area       <- 0
+    n_removed      <- 0
+
+    for (type in names(res)) {
+      s <- res[[type]]
+      if (input$remove_outliers) {
+        cutoff    <- quantile(s$rate_per_100k, 0.975)
+        n_removed <- n_removed + sum(s$rate_per_100k > cutoff)
+        s <- s %>% filter(rate_per_100k <= cutoff)
+      }
+      if (input$top_100) s <- s %>% slice_max(rate_per_100k, n = 100)
+
+      all_fatalities <- all_fatalities + sum(s$fatalities)
+      all_clusters   <- all_clusters   + nrow(s)
+      all_area       <- all_area       + sum(s$area_sq_km)
     }
 
-    if (input$top_100) {
-      s <- s %>% slice_max(rate_per_100k, n = 100)
-    }
-
-    displayed_fatalities <- sum(s$fatalities)
-    displayed_clusters <- nrow(s)
-    pct <- round(displayed_fatalities / total_fatalities * 100, 1)
-
-    total_area_km2 <- round(sum(s$area_sq_km), 2)
+    pct <- round(all_fatalities / total * 100, 1)
 
     tags <- tagList(
-      h4(paste0(pct, "% of IL fatalities")),
-      p(paste0(displayed_fatalities, " of ", total_fatalities, " fatalities")),
-      p(paste0("across ", displayed_clusters, " clusters")),
-      p(paste0("Total cluster area: ", total_area_km2, " km\u00B2"))
+      h4(paste0(pct, "% of selected fatalities")),
+      p(paste0(all_fatalities, " of ", total, " fatalities")),
+      p(paste0("across ", all_clusters, " clusters")),
+      p(paste0("Total cluster area: ", round(all_area, 2), " km²"))
     )
 
     if (n_removed > 0) {

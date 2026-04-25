@@ -21,6 +21,7 @@ library(dbscan)
 library(osmdata)
 library(lwgeom)
 library(tidyr)
+library(rsconnect)
 
 # Load the data
 download_fars_year <- function(year, dest_dir = "fars_raw") {
@@ -199,10 +200,50 @@ load_fars_il <- function(year) {
       LATITUDE >= 36, LATITUDE <= 43,
       LONGITUD >= -92, LONGITUD <= -87
     ) %>%
-    select(ST_CASE, STATE, COUNTY, LATITUDE, LONGITUD, FATALS, year)
+    mutate(PEDS = if ("PEDS" %in% names(.)) as.integer(PEDS) else 0L) %>%
+    select(ST_CASE, STATE, COUNTY, LATITUDE, LONGITUD, FATALS, PEDS, year)
+}
+
+load_fars_vehicles <- function(year) {
+  veh_file <- list.files(
+    file.path("fars_raw", year),
+    pattern = "^vehicle\\.csv$",
+    recursive = TRUE,
+    ignore.case = TRUE,
+    full.names = TRUE
+  )
+  if (length(veh_file) == 0) return(NULL)
+  df <- read_csv(veh_file[1], col_types = cols(.default = col_guess()))
+  names(df) <- toupper(names(df))
+  if (!"BODY_TYP" %in% names(df)) return(NULL)
+  df %>%
+    filter(STATE == 17) %>%
+    mutate(year = as.integer(year), ST_CASE = as.numeric(ST_CASE)) %>%
+    select(ST_CASE, year, BODY_TYP)
 }
 
 all_accidents_il <- purrr::map_dfr(years, load_fars_il)
+
+# Classify each crash as pedestrian, motorcycle, or car
+all_vehicles_il <- purrr::map_dfr(years, load_fars_vehicles)
+
+motorcycle_cases <- all_vehicles_il %>%
+  filter(BODY_TYP >= 20, BODY_TYP <= 29) %>%
+  select(ST_CASE, year) %>%
+  distinct() %>%
+  mutate(is_motorcycle = TRUE)
+
+all_accidents_il <- all_accidents_il %>%
+  mutate(ST_CASE = as.numeric(ST_CASE)) %>%
+  left_join(motorcycle_cases, by = c("ST_CASE", "year")) %>%
+  mutate(
+    is_motorcycle = replace_na(is_motorcycle, FALSE),
+    crash_type = case_when(
+      PEDS > 0       ~ "pedestrian",
+      is_motorcycle  ~ "motorcycle",
+      TRUE           ~ "car"
+    )
+  )
 
 # Make spatial and transform to meters
 all_accidents_sf <- st_as_sf(
@@ -304,14 +345,20 @@ leaflet(cluster_pts_all) %>%
   )
 
 ### Save precomputed data for Shiny app
+fatalities_by_type <- all_accidents_il %>%
+  group_by(crash_type) %>%
+  summarize(fatalities = sum(FATALS), .groups = "drop")
+
 saveRDS(
   list(
     snap_pts = all_snap_pts,
     fatals = all_accidents_sf$FATALS,
     years = all_accidents_sf$year,
     segment_ids = all_accidents_sf$segment_id,
+    crash_type = all_accidents_sf$crash_type,
     aadt_lookup = roads_aadt_2023_m %>% st_drop_geometry() %>% select(segment_id, AADT),
-    total_il_fatalities = total_il_fatalities
+    total_il_fatalities = total_il_fatalities,
+    fatalities_by_type = fatalities_by_type
   ),
   "cluster_app_data.rds"
 )
